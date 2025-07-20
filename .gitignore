@@ -37,4 +37,5 @@ output/
 
 *.png
 chunk/*
+chunks/*
 json/*
