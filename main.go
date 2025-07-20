@@ -24,6 +24,7 @@ const (
 	DataDir    = "data"
 	OutputDir  = "output"
 	ChunkDir   = "chunk"
+	JSONDir    = "json"
 	TempPrefix = "temp_page_"
 	PageSep    = "\n\n--- Page %d ---\n\n"
 )
@@ -57,17 +58,26 @@ type OpenAIResponse struct {
 	} `json:"choices"`
 }
 
+// ChunkData represents a structured chunk for vector database embedding
+type ChunkData struct {
+	Filename   string `json:"filename"`
+	ChunkIndex int    `json:"chunk_index"`
+	PageRange  string `json:"page_range"`
+	Text       string `json:"text"`
+}
+
 // PDFProcessor handles PDF text extraction with OCR fallback and intelligent chunking
 type PDFProcessor struct {
 	dataDir   string
 	outputDir string
 	chunkDir  string
+	jsonDir   string
 	apiKey    string
 	useAI     bool
 }
 
 // NewPDFProcessor creates a new PDF processor instance
-func NewPDFProcessor(dataDir, outputDir, chunkDir string) *PDFProcessor {
+func NewPDFProcessor(dataDir, outputDir, chunkDir, jsonDir string) *PDFProcessor {
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	useAI := apiKey != ""
 
@@ -79,13 +89,14 @@ func NewPDFProcessor(dataDir, outputDir, chunkDir string) *PDFProcessor {
 		dataDir:   dataDir,
 		outputDir: outputDir,
 		chunkDir:  chunkDir,
+		jsonDir:   jsonDir,
 		apiKey:    apiKey,
 		useAI:     useAI,
 	}
 }
 
 func main() {
-	processor := NewPDFProcessor(DataDir, OutputDir, ChunkDir)
+	processor := NewPDFProcessor(DataDir, OutputDir, ChunkDir, JSONDir)
 
 	if err := processor.ensureDirectories(); err != nil {
 		log.Fatal("Failed to create directories:", err)
@@ -98,7 +109,7 @@ func main() {
 
 // ensureDirectories creates the output and chunk directories if they don't exist
 func (p *PDFProcessor) ensureDirectories() error {
-	dirs := []string{p.outputDir, p.chunkDir}
+	dirs := []string{p.outputDir, p.chunkDir, p.jsonDir}
 	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return fmt.Errorf("failed to create directory %s: %w", dir, err)
@@ -149,7 +160,7 @@ func (p *PDFProcessor) processSinglePDF(filename string) error {
 
 	// Create intelligent chunks
 	chunkDir := filepath.Join(p.chunkDir, strings.TrimSuffix(filename, ".pdf"))
-	if err := p.createIntelligentChunks(outputPath, chunkDir); err != nil {
+	if err := p.createIntelligentChunks(outputPath, chunkDir, filename); err != nil {
 		return err
 	}
 
@@ -270,7 +281,7 @@ func (p *PDFProcessor) runTesseract(imagePath string) (string, error) {
 }
 
 // createIntelligentChunks creates intelligent chunks using AI or local processing
-func (p *PDFProcessor) createIntelligentChunks(textFilePath, chunkDir string) error {
+func (p *PDFProcessor) createIntelligentChunks(textFilePath, chunkDir, filename string) error {
 	// Read the extracted text
 	content, err := os.ReadFile(textFilePath)
 	if err != nil {
@@ -289,15 +300,15 @@ func (p *PDFProcessor) createIntelligentChunks(textFilePath, chunkDir string) er
 
 	if p.useAI {
 		fmt.Printf("   🧠 Creating AI-powered intelligent chunks...\n")
-		return p.createAIChunks(text, chunkDir)
+		return p.createAIChunks(text, chunkDir, filename)
 	} else {
 		fmt.Printf("   🧠 Creating local intelligent chunks...\n")
-		return p.createLocalChunks(text, chunkDir)
+		return p.createLocalChunks(text, chunkDir, filename)
 	}
 }
 
 // createAIChunks creates chunks using OpenAI API
-func (p *PDFProcessor) createAIChunks(text, chunkDir string) error {
+func (p *PDFProcessor) createAIChunks(text, chunkDir, filename string) error {
 	// Split text into manageable chunks for AI processing
 	textChunks := p.splitTextIntoChunks(text)
 
@@ -325,6 +336,11 @@ func (p *PDFProcessor) createAIChunks(text, chunkDir string) error {
 			fmt.Printf("   ✅ Saved chunk_%d.txt (%d chars)\n", chunkIndex, len(intelligentChunk))
 		}
 
+		// Create JSON chunk
+		if err := p.createJSONChunk(chunk, chunkIndex, filename); err != nil {
+			log.Printf("   ⚠️  Warning: failed to create JSON chunk %d: %v", chunkIndex, err)
+		}
+
 		chunkIndex++
 	}
 
@@ -333,7 +349,7 @@ func (p *PDFProcessor) createAIChunks(text, chunkDir string) error {
 }
 
 // createLocalChunks creates chunks using local intelligent processing
-func (p *PDFProcessor) createLocalChunks(text, chunkDir string) error {
+func (p *PDFProcessor) createLocalChunks(text, chunkDir, filename string) error {
 	chunks := p.splitTextIntoLocalChunks(text)
 
 	chunkIndex := 1
@@ -351,6 +367,11 @@ func (p *PDFProcessor) createLocalChunks(text, chunkDir string) error {
 			log.Printf("   ⚠️  Warning: failed to save chunk %d: %v", chunkIndex, err)
 		} else {
 			fmt.Printf("   ✅ Saved chunk_%d.txt (%d chars)\n", chunkIndex, len(formattedChunk))
+		}
+
+		// Create JSON chunk
+		if err := p.createJSONChunk(chunk, chunkIndex, filename); err != nil {
+			log.Printf("   ⚠️  Warning: failed to create JSON chunk %d: %v", chunkIndex, err)
 		}
 
 		chunkIndex++
@@ -467,19 +488,30 @@ func (p *PDFProcessor) isNaturalBreak(line string, lineIndex int, allLines []str
 func (p *PDFProcessor) formatLocalChunk(chunk string, chunkNum, totalChunks int) string {
 	var formatted strings.Builder
 
-	// Add chunk header
-	formatted.WriteString(fmt.Sprintf("# Chunk %d of %d\n\n", chunkNum, totalChunks))
-
-	// Extract and format document metadata if present
+	// Extract metadata
 	metadata := p.extractMetadata(chunk)
-	if metadata != "" {
-		formatted.WriteString("## Document Information\n")
-		formatted.WriteString(metadata + "\n\n")
+	pageRange := p.extractPageRange(chunk)
+
+	// Add comprehensive metadata header
+	formatted.WriteString("# Document Chunk\n\n")
+
+	// Metadata section
+	formatted.WriteString("## Metadata\n")
+	formatted.WriteString(fmt.Sprintf("- **Chunk Number**: %d of %d\n", chunkNum, totalChunks))
+
+	if pageRange != "" {
+		formatted.WriteString(fmt.Sprintf("- **Page Range**: %s\n", pageRange))
 	}
 
-	// Format the main content
+	if metadata != "" {
+		formatted.WriteString(metadata)
+	}
+
+	formatted.WriteString("\n")
+
+	// Content section with clear formatting for future embedding
 	formatted.WriteString("## Content\n\n")
-	formatted.WriteString(chunk)
+	formatted.WriteString(p.cleanAndStructureContent(chunk))
 
 	return formatted.String()
 }
@@ -500,13 +532,132 @@ func (p *PDFProcessor) extractMetadata(chunk string) string {
 		metadata.WriteString(fmt.Sprintf("- **Date**: %s\n", strings.Join(matches, ", ")))
 	}
 
-	// Look for page numbers
-	pagePattern := regexp.MustCompile(`Page\s+(\d+)`)
-	if matches := pagePattern.FindAllString(chunk, -1); len(matches) > 0 {
-		metadata.WriteString(fmt.Sprintf("- **Pages**: %s\n", strings.Join(matches, ", ")))
+	// Look for document titles
+	titlePattern := regexp.MustCompile(`(?m)^([A-Z][A-Za-z\s]{3,50})$`)
+	if matches := titlePattern.FindAllString(chunk, -1); len(matches) > 0 {
+		// Filter out common non-titles
+		var titles []string
+		for _, match := range matches {
+			trimmed := strings.TrimSpace(match)
+			if !strings.Contains(trimmed, "Page") && !strings.Contains(trimmed, "---") &&
+				len(trimmed) > 5 && len(trimmed) < 100 {
+				titles = append(titles, trimmed)
+			}
+		}
+		if len(titles) > 0 {
+			metadata.WriteString(fmt.Sprintf("- **Document Title**: %s\n", strings.Join(titles[:1], ", ")))
+		}
 	}
 
 	return metadata.String()
+}
+
+// extractPageRange extracts page range from the chunk
+func (p *PDFProcessor) extractPageRange(chunk string) string {
+	// Look for page separators like "--- Page X ---"
+	pagePattern := regexp.MustCompile(`--- Page (\d+) ---`)
+	matches := pagePattern.FindAllStringSubmatch(chunk, -1)
+
+	if len(matches) == 0 {
+		return ""
+	}
+
+	if len(matches) == 1 {
+		// Single page
+		return fmt.Sprintf("Page %s", matches[0][1])
+	}
+
+	// Multiple pages - get first and last
+	firstPage := matches[0][1]
+	lastPage := matches[len(matches)-1][1]
+
+	if firstPage == lastPage {
+		return fmt.Sprintf("Page %s", firstPage)
+	}
+
+	return fmt.Sprintf("Page %s–%s", firstPage, lastPage)
+}
+
+// cleanAndStructureContent cleans and structures the content for better embedding
+func (p *PDFProcessor) cleanAndStructureContent(chunk string) string {
+	lines := strings.Split(chunk, "\n")
+	var cleaned strings.Builder
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		// Skip empty lines at the beginning and end
+		if trimmed == "" && (i == 0 || i == len(lines)-1) {
+			continue
+		}
+
+		// Clean up page separators
+		if strings.Contains(trimmed, "--- Page") {
+			cleaned.WriteString(fmt.Sprintf("\n### Page %s\n\n",
+				regexp.MustCompile(`Page (\d+)`).FindStringSubmatch(trimmed)[1]))
+			continue
+		}
+
+		// Format headings
+		if p.isHeading(trimmed) {
+			cleaned.WriteString(fmt.Sprintf("\n### %s\n\n", trimmed))
+			continue
+		}
+
+		// Format bullet points and numbered lists
+		if strings.HasPrefix(trimmed, "•") || strings.HasPrefix(trimmed, "-") ||
+			strings.HasPrefix(trimmed, "*") {
+			cleaned.WriteString(fmt.Sprintf("- %s\n", strings.TrimSpace(trimmed[1:])))
+			continue
+		}
+
+		// Format numbered lists
+		if matched, _ := regexp.MatchString(`^\d+\.`, trimmed); matched {
+			cleaned.WriteString(fmt.Sprintf("%s\n", trimmed))
+			continue
+		}
+
+		// Regular text
+		if trimmed != "" {
+			cleaned.WriteString(trimmed + "\n")
+		} else {
+			cleaned.WriteString("\n")
+		}
+	}
+
+	return strings.TrimSpace(cleaned.String())
+}
+
+// isHeading checks if a line is a heading
+func (p *PDFProcessor) isHeading(line string) bool {
+	trimmed := strings.TrimSpace(line)
+
+	// Check for various heading patterns
+	headingPatterns := []string{
+		`^Bab\s+\d+`,         // Bab 1, Bab 2, etc.
+		`^Pasal\s+\d+`,       // Pasal 1, Pasal 2, etc.
+		`^Chapter\s+\d+`,     // Chapter 1, Chapter 2, etc.
+		`^Section\s+\d+`,     // Section 1, Section 2, etc.
+		`^Artikel\s+\d+`,     // Artikel 1, Artikel 2, etc.
+		`^BAB\s+\d+`,         // BAB 1, BAB 2, etc.
+		`^PASAL\s+\d+`,       // PASAL 1, PASAL 2, etc.
+		`^\d+\.\s+[A-Z]`,     // 1. Title, 2. Title, etc.
+		`^[A-Z][A-Z\s]{3,}$`, // ALL CAPS HEADINGS
+		`^[A-Z][a-z\s]{3,}$`, // Title Case Headings
+	}
+
+	for _, pattern := range headingPatterns {
+		if matched, _ := regexp.MatchString(pattern, trimmed); matched {
+			return true
+		}
+	}
+
+	// Check if it looks like a heading (short, ends with colon or period)
+	if len(trimmed) < 100 && (strings.HasSuffix(trimmed, ":") || strings.HasSuffix(trimmed, ".")) {
+		return true
+	}
+
+	return false
 }
 
 // createLocalIntelligentChunk creates a local intelligent chunk (fallback for AI)
@@ -630,4 +781,42 @@ func (p *PDFProcessor) callOpenAIAPI(request OpenAIRequest) (*OpenAIResponse, er
 	}
 
 	return &response, nil
+}
+
+// createJSONChunk creates a JSON object for vector database embedding
+func (p *PDFProcessor) createJSONChunk(chunk string, chunkIndex int, filename string) error {
+	// Extract page range
+	pageRange := p.extractPageRange(chunk)
+
+	// Clean and structure the text
+	cleanedText := p.cleanAndStructureContent(chunk)
+
+	// Create chunk data
+	chunkData := ChunkData{
+		Filename:   filename,
+		ChunkIndex: chunkIndex,
+		PageRange:  pageRange,
+		Text:       cleanedText,
+	}
+
+	// Marshal to JSON
+	jsonData, err := json.Marshal(chunkData)
+	if err != nil {
+		return fmt.Errorf("failed to marshal JSON: %w", err)
+	}
+
+	// Create JSON directory for this file
+	jsonFileDir := filepath.Join(p.jsonDir, strings.TrimSuffix(filename, ".pdf"))
+	if err := os.MkdirAll(jsonFileDir, 0755); err != nil {
+		return fmt.Errorf("failed to create JSON directory: %w", err)
+	}
+
+	// Save JSON file
+	jsonPath := filepath.Join(jsonFileDir, fmt.Sprintf("chunk_%d.json", chunkIndex))
+	if err := os.WriteFile(jsonPath, jsonData, 0644); err != nil {
+		return fmt.Errorf("failed to save JSON file: %w", err)
+	}
+
+	fmt.Printf("   📄 Saved chunk_%d.json (%d chars)\n", chunkIndex, len(cleanedText))
+	return nil
 }
